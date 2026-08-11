@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cpr/cpr.h>
 #include <ctime>
 #include <random>
@@ -105,7 +106,12 @@ protected:
     void clean();
 
 private:
-    bool isCancel{};
+    // Accessed by both the main thread (cancel()) and cpr worker threads
+    // (ProgressCallback, requestImage body). Must be atomic; plain `bool`
+    // is a data race and on non-x86 platforms (Switch / PSV / ARM) writes
+    // do not have single-byte atomicity guarantees w.r.t. surrounding
+    // fields.
+    std::atomic<bool> isCancel{false};
     brls::Image* imageView;
     std::string imageUrl;
     Pool::iterator currentIter;
