@@ -138,7 +138,7 @@ std::shared_ptr<ImageHelper> ImageHelper::with(brls::Image* view) {
     requestMap[view]  = iter;
     item->currentIter = iter;
     // 重置 "取消" 标记位
-    item->isCancel = false;
+    item->isCancel.store(false, std::memory_order_relaxed);
     // 禁止图片组件销毁
     item->imageView->ptrLock();
     // 设置图片组件不处理纹理的销毁，由缓存统一管理纹理销毁
@@ -177,11 +177,11 @@ void ImageHelper::load(const std::string &url) {
     //todo: 可能会发生同时请求多个重复链接的情况，此种情况下最好合并为一个请求
 
     // 缓存网络图片
-    brls::Logger::verbose("request Image 1: {} {}", this->imageUrl, this->isCancel);
+    brls::Logger::verbose("request Image 1: {} {}", this->imageUrl, this->isCancel.load(std::memory_order_relaxed));
     ImageThreadPool::instance().Submit([this]() {
         brls::Logger::verbose("Submit view: {} {} {} {}", (size_t)this->imageView, (size_t)this, this->imageUrl,
-                              this->isCancel);
-        if (this->isCancel) {
+                              this->isCancel.load(std::memory_order_relaxed));
+        if (this->isCancel.load(std::memory_order_relaxed)) {
             this->clean();
             return;
         }
@@ -200,7 +200,7 @@ static inline void freeImageData(uint8_t* imageData, bool isWebp) {
 }
 
 void ImageHelper::requestImage() {
-    brls::Logger::verbose("request Image 2: {} {}", this->imageUrl, this->isCancel);
+    brls::Logger::verbose("request Image 2: {} {}", this->imageUrl, this->isCancel.load(std::memory_order_relaxed));
 
     // 请求图片
     cpr::Session session;
@@ -212,12 +212,15 @@ void ImageHelper::requestImage() {
     session.SetVerifySsl(bilibili::HTTP::VERIFY);
     session.SetProxies(bilibili::HTTP::PROXIES);
     session.SetUrl(cpr::Url{this->imageUrl});
-    session.SetProgressCallback(cpr::ProgressCallback([this](...) -> bool { return !this->isCancel; }));
+    session.SetProgressCallback(cpr::ProgressCallback(
+        [this](...) -> bool { return !this->isCancel.load(std::memory_order_relaxed); }));
     cpr::Response r = session.Get();
 
     // 图片请求失败或取消请求
-    if (r.status_code != 200 || r.downloaded_bytes == 0 || this->isCancel) {
-        brls::Logger::verbose("request undone: {} {} {} {}", r.status_code, r.downloaded_bytes, this->isCancel,
+    if (r.status_code != 200 || r.downloaded_bytes == 0 ||
+        this->isCancel.load(std::memory_order_relaxed)) {
+        brls::Logger::verbose("request undone: {} {} {} {}", r.status_code, r.downloaded_bytes,
+                              this->isCancel.load(std::memory_order_relaxed),
                               r.url.str());
 
         this->clean();
@@ -278,7 +281,7 @@ void ImageHelper::requestImage() {
 
             if (tex > 0) {
                 brls::TextureCache::instance().addCache(this->imageUrl, tex);
-                if (!this->isCancel) {
+                if (!this->isCancel.load(std::memory_order_relaxed)) {
                     brls::Logger::verbose("load image: {}", this->imageUrl);
                     this->imageView->innerSetImage(tex);
                 }
@@ -326,7 +329,9 @@ void ImageHelper::clear(brls::Image* view) {
 
 void ImageHelper::cancel() {
     brls::Logger::verbose("Cancel request: {}", this->imageUrl);
-    this->isCancel = true;
+    // release so that worker-thread observe sees the cancellation together
+    // with any other state we touch under requestMutex.
+    this->isCancel.store(true, std::memory_order_release);
 }
 
 void ImageHelper::setRequestThreads(size_t num) {
