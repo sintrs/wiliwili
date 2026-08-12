@@ -18,7 +18,6 @@
 #include "utils/string_helper.hpp"
 #include "utils/gesture_helper.hpp"
 #include "utils/activity_helper.hpp"
-#include "activity/player_activity.hpp"
 #include "fragment/player_danmaku_setting.hpp"
 #include "fragment/player_setting.hpp"
 #include "fragment/player_dlna_search.hpp"
@@ -34,6 +33,8 @@
 #include "view/video_profile.hpp"
 #include "view/danmaku_core.hpp"
 #include "view/mpv_core.hpp"
+
+using namespace brls::literals;
 
 enum ClickState { IDLE = 0, PRESS = 1, FAST_RELEASE = 3, FAST_PRESS = 4, CLICK_DOUBLE = 5 };
 
@@ -469,7 +470,11 @@ VideoView::VideoView() {
             this->showOSD(true);
             if (isTvControlMode) {
                 // 焦点设置在默认位置
-                brls::sync([this]() { brls::Application::giveFocus(this); });
+                ASYNC_RETAIN
+                brls::sync([ASYNC_TOKEN]() {
+                    ASYNC_RELEASE
+                    brls::Application::giveFocus(this);
+                });
             } else {
                 // 直接切换播放状态
                 this->togglePlay();
@@ -540,13 +545,12 @@ void VideoView::requestVolume(int volume, int delay) {
         this->setCenterHintIcon("svg/bpx-svg-sprite-volume.svg");
     } else {
         brls::cancelDelay(volume_iter);
+        volume_iter = 0;
     }
-    ASYNC_RETAIN
-    volume_iter = brls::delay(delay, [ASYNC_TOKEN]() {
-        ASYNC_RELEASE
+    volume_iter = brls::delay(delay, [this]() {
+        this->volume_iter = 0;
         this->hideCenterHint();
         ProgramConfig::instance().setSettingItem(SettingItem::PLAYER_VOLUME, MPVCore::VIDEO_VOLUME);
-        this->volume_iter = 0;
     });
 }
 
@@ -590,7 +594,10 @@ void VideoView::requestSeeking(int seek, int delay) {
     }
 
     // 取消之前的延迟触发
-    brls::cancelDelay(seeking_iter);
+    if (seeking_iter != 0) {
+        brls::cancelDelay(seeking_iter);
+        seeking_iter = 0;
+    }
     if (delay <= 0) {
         this->hideCenterHint();
         this->showThumbnailPreview = false;
@@ -602,9 +609,8 @@ void VideoView::requestSeeking(int seek, int delay) {
     } else {
         // 延迟触发跳转进度
         is_seeking = true;
-        ASYNC_RETAIN
-        seeking_iter = brls::delay(delay, [ASYNC_TOKEN, seek]() {
-            ASYNC_RELEASE
+        seeking_iter = brls::delay(delay, [this, seek]() {
+            this->seeking_iter = 0;
             this->hideCenterHint();
             this->showThumbnailPreview = false;
             seeking_range = 0;
@@ -618,6 +624,8 @@ void VideoView::requestSeeking(int seek, int delay) {
 
 VideoView::~VideoView() {
     brls::Logger::debug("trying delete VideoView...");
+    if (seeking_iter != 0) brls::cancelDelay(seeking_iter);
+    if (volume_iter != 0) brls::cancelDelay(volume_iter);
     this->unRegisterMpvEvent();
     APP_E->unsubscribe(customEventSubscribeID);
     brls::Logger::debug("Delete VideoView done");
@@ -1219,6 +1227,40 @@ bool VideoView::isFullscreen() {
     return rect.getHeight() == brls::Application::contentHeight && rect.getWidth() == brls::Application::contentWidth;
 }
 
+void VideoView::syncFullscreenStateTo(VideoView* video) {
+    video->setTitle(this->getTitle());
+    video->setOnlineCount(this->videoOnlineCountLabel->getFullText());
+    video->setProgress(this->getProgress());
+    video->showOSD(this->osd_state != OSDState::ALWAYS_ON);
+    video->setDuration(this->rightStatusLabel->getFullText());
+    video->setPlaybackTime(this->leftStatusLabel->getFullText());
+    video->showReplay    = showReplay;
+    video->real_duration = real_duration;
+    video->setLastPlayedPosition(lastPlayedPosition);
+    video->osdSlider->setClipPoint(osdSlider->getClipPoint());
+    video->setBangumiCustomSetting(this->bangumiTitle, this->bangumiSeasonId);
+    video->setHighlightProgress(highlightData);
+    video->setQuality(this->getQuality());
+    video->videoSpeed->setText(this->videoSpeed->getFullText());
+    video->refreshToggleIcon();
+    video->refreshDanmakuIcon();
+
+    if (MPVCore::instance().isPaused()) {
+        video->pause();
+    } else if (MPVCore::instance().isPlaying()) {
+        video->resume();
+    }
+
+    if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
+        video->hideLoading();
+    } else {
+        video->showLoading();
+    }
+
+    DanmakuCore::instance().refresh();
+    LiveDanmakuCore::instance().refresh();
+}
+
 void VideoView::setFullScreen(bool fs) {
     if (!allowFullscreen) {
         brls::Logger::error("Not being allowed to set fullscreen");
@@ -1229,6 +1271,12 @@ void VideoView::setFullScreen(bool fs) {
         brls::Logger::error("Already set fullscreen state to: {}", fs);
         return;
     }
+
+    if (fullscreenTransitionPending) {
+        brls::Logger::warning("VideoView fullscreen transition already pending");
+        return;
+    }
+    fullscreenTransitionPending = true;
 
     brls::Logger::info("VideoView set fullscreen state: {}", fs);
     if (fs) {
@@ -1293,117 +1341,35 @@ void VideoView::setFullScreen(bool fs) {
         ASYNC_RETAIN
         brls::sync([ASYNC_TOKEN]() {
             ASYNC_RELEASE
-            //todo: a better way to get videoView pointer
             auto activityStack = brls::Application::getActivitiesStack();
-
-            // 当最前方的 activity 内不包含 videoView 时，不执行关闭全屏
-            brls::Activity* top = activityStack[activityStack.size() - 1];
-            if (!dynamic_cast<BasePlayerActivity*>(top)) {
-                // 判断最顶层是否为video
-                if (!dynamic_cast<VideoView*>(top->getContentView()->getView("video"))) return;
-            }
-
-            // 同时点击全屏按钮和评论会导致评论弹出在 BasePlayerActivity 和 videoView 之间，
-            // 因此目前需要遍历全部的 activity 找到 BasePlayerActivity 或包含VideoView的Activity
-            if (activityStack.size() <= 2) {
-                brls::Application::popActivity();
-#ifdef ALLOW_FULLSCREEN
-                // 应用内全屏退出时同步还原窗口全屏状态
-                if (WINDOW_FULLSCREEN_ON_APP_FULLSCREEN && WINDOW_FULLSCREEN_TRIGGERED) {
-                    WINDOW_FULLSCREEN_TRIGGERED = false;
-                    ProgramConfig::instance().setWindowFullscreen(false);
-                }
-#endif
+            brls::Activity* owner = this->getParentActivity();
+            if (activityStack.empty() || owner == nullptr || activityStack.back() != owner) {
+                fullscreenTransitionPending = false;
                 return;
             }
 
-            bool found = false;
-            for (size_t i = activityStack.size() - 2; i != 0; i--) {
-                // 检查是否为BasePlayerActivity
-                auto* last = dynamic_cast<BasePlayerActivity*>(activityStack[i]);
-                if (last) {
-                    auto* video = dynamic_cast<VideoView*>(last->getView("video"));
-                    if (video) {
-                        // 将当前播放状态传递给小窗
-                        video->setProgress(this->getProgress());
-                        video->showOSD(this->osd_state != OSDState::ALWAYS_ON);
-                        video->setDuration(this->rightStatusLabel->getFullText());
-                        video->setPlaybackTime(this->leftStatusLabel->getFullText());
-                        video->registerMpvEvent();
-                        video->showReplay    = showReplay;
-                        video->real_duration = real_duration;
-                        video->setLastPlayedPosition(lastPlayedPosition);
-                        video->osdSlider->setClipPoint(osdSlider->getClipPoint());
-                        video->setBangumiCustomSetting(this->bangumiTitle, this->bangumiSeasonId);
-                        video->refreshToggleIcon();
-                        video->setHighlightProgress(highlightData);
-                        video->refreshDanmakuIcon();
-                        video->setQuality(this->getQuality());
-                        video->videoSpeed->setText(this->videoSpeed->getFullText());
-                        DanmakuCore::instance().refresh();
-                        LiveDanmakuCore::instance().refresh();
-
-                        // 同步播放/暂停状态
-                        if (MPVCore::instance().isPaused()) {
-                            video->pause();
-                        } else if (MPVCore::instance().isPlaying()) {
-                            video->resume();
-                        }
-
-                        if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
-                            video->hideLoading();
-                        } else {
-                            video->showLoading();
-                        }
-                        found = true;
-                        break;
-                    }
-                } else {
-                    // 如果不是BasePlayerActivity，检查是否是包含VideoView的Activity
-                    // 这可能是LiveActivity或其他类型的Activity
-                    auto* contentView = activityStack[i]->getContentView();
-                    if (contentView) {
-                        auto* video = dynamic_cast<VideoView*>(contentView->getView("video"));
-                        if (video) {
-                            // 对于非BasePlayerActivity中的VideoView，也应该同步状态
-                            video->setProgress(this->getProgress());
-                            video->showOSD(this->osd_state != OSDState::ALWAYS_ON);
-                            video->setDuration(this->rightStatusLabel->getFullText());
-                            video->setPlaybackTime(this->leftStatusLabel->getFullText());
-                            video->registerMpvEvent();
-                            video->refreshToggleIcon();
-                            video->refreshDanmakuIcon();
-                            video->setQuality(this->getQuality());
-
-                            // 同步播放/暂停状态
-                            if (MPVCore::instance().isPaused()) {
-                                video->pause();
-                            } else if (MPVCore::instance().isPlaying()) {
-                                video->resume();
-                            }
-
-                            DanmakuCore::instance().refresh();
-                            LiveDanmakuCore::instance().refresh();
-
-                            if (osdCenterBox->getVisibility() == brls::Visibility::GONE) {
-                                video->hideLoading();
-                            } else {
-                                video->showLoading();
-                            }
-                            found = true;
-                            break;
-                        }
-                    }
-                }
+            VideoView* targetVideo = nullptr;
+            for (size_t i = activityStack.size() - 1; i > 0; --i) {
+                brls::View* content = activityStack[i - 1]->getContentView();
+                if (content == nullptr) continue;
+                targetVideo = dynamic_cast<VideoView*>(content->getView("video"));
+                if (targetVideo != nullptr) break;
             }
 
-            // 如果没有找到合适的Activity，但仍需要退出全屏
-            if (!found) {
-                brls::Logger::debug("No suitable activity found to return to when exiting fullscreen");
+            if (targetVideo != nullptr) {
+                this->syncFullscreenStateTo(targetVideo);
+                this->unRegisterMpvEvent();
+                targetVideo->registerMpvEvent();
             }
 
-            // Pop fullscreen videoView
-            brls::Application::popActivity(brls::TransitionAnimation::NONE);
+            if (!brls::Application::popActivity(brls::TransitionAnimation::NONE)) {
+                if (targetVideo != nullptr) targetVideo->unRegisterMpvEvent();
+                this->registerMpvEvent();
+                fullscreenTransitionPending = false;
+                return;
+            }
+
+            if (targetVideo != nullptr) targetVideo->fullscreenTransitionPending = false;
 #ifdef ALLOW_FULLSCREEN
             // 应用内全屏退出时同步还原窗口全屏状态
             if (WINDOW_FULLSCREEN_ON_APP_FULLSCREEN && WINDOW_FULLSCREEN_TRIGGERED) {
@@ -1542,7 +1508,8 @@ void VideoView::buttonProcessing() {
 
 void VideoView::registerMpvEvent() {
     if (registerMPVEvent) {
-        brls::Logger::error("VideoView already register MPV Event");
+        brls::Logger::warning("VideoView already registered MPV event");
+        return;
     }
     eventSubscribeID = mpvCore->getEvent()->subscribe([this](MpvEventEnum event) {
         // brls::Logger::info("mpv event => : {}", event);
@@ -1746,4 +1713,3 @@ void VideoView::registerCommonActions(brls::Activity* activity) {
         return true;
     });
 }
-
